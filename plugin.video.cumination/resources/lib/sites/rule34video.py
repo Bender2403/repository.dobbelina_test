@@ -16,11 +16,15 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
+import os
 import re
 import time
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from resources.lib import utils
 from resources.lib.adultsite import AdultSite
-from six.moves import urllib_parse
+from six.moves import urllib_parse, urllib_request
+from resources.lib.basics import profileDir
 
 site = AdultSite('rule34video', '[COLOR hotpink]Rule34 Video[/COLOR]', 'https://rule34video.com/', 'rule34video.png', 'rule34video')
 
@@ -34,15 +38,65 @@ def Main():
     utils.eod()
 
 
+THUMB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+THUMB_DIR = os.path.join(profileDir, 'thumbnails', 'rule34video')
+
+
+def _thumb_ext(data):
+    """Erkennt das echte Bildformat am Dateianfang."""
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'webp'
+    if data[:3] == b'\xff\xd8\xff':
+        return 'jpg'
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'png'
+    return None
+
+
+def _fix_thumb(img):
+    """Die Seite liefert WebP-Bilder mit .jpg-Endung, die Kodi 21.3 nicht anzeigt.
+    Bild laden, echtes Format erkennen und mit passender Endung lokal speichern."""
+    if not img:
+        return img
+    try:
+        key = hashlib.md5(img.encode('utf-8')).hexdigest()
+        for ext in ('webp', 'jpg', 'png'):
+            cached = os.path.join(THUMB_DIR, '{0}.{1}'.format(key, ext))
+            if os.path.exists(cached):
+                return cached
+        candidates = [img]
+        for a, b in (('320x180', '336x189'), ('336x189', '320x180')):
+            if a in img:
+                candidates.append(img.replace(a, b))
+        for url in candidates:
+            try:
+                req = urllib_request.Request(url, headers={'User-Agent': THUMB_UA, 'Referer': site.url})
+                data = urllib_request.urlopen(req, timeout=15).read()
+            except Exception:
+                continue
+            ext = _thumb_ext(data)
+            if ext:
+                os.makedirs(THUMB_DIR, exist_ok=True)
+                path = os.path.join(THUMB_DIR, '{0}.{1}'.format(key, ext))
+                with open(path, 'wb') as f:
+                    f.write(data)
+                return path
+    except Exception as e:
+        utils.kodilog('rule34video thumbnail: {0}'.format(e))
+    return img
+
+
 @site.register()
 def List(url):
     listhtml = utils.getHtml(url, site.url)
     match = re.compile(r'open-popup"\s+href="([^"]+)".*?<img[^>]+src="([^"]+)"[^>]+alt="([^"]+)".*?(<div class="quality">.*?</div>)?.*?class="time">([^<]+)<', re.DOTALL | re.IGNORECASE).findall(listhtml)
 
-    thumbnails = utils.Thumbnails(site.name)
-    for videopage, img, name, hd, duration in match:
+    os.makedirs(THUMB_DIR, exist_ok=True)
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        fixed_imgs = list(executor.map(_fix_thumb, [m[1] for m in match]))
+
+    for (videopage, _img, name, hd, duration), img in zip(match, fixed_imgs):
         name = utils.cleantext(name.strip())
-        img = thumbnails.fix_img(img)
         hd = " [COLOR orange]HD[/COLOR]" if 'hd' in hd else ''
 
         cm = []
